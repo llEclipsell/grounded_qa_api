@@ -326,31 +326,68 @@ def build_answer(
                 chunk_id
             )
 
-
     # -----------------------------------------------------
-    # Confidence
+    # Confidence based on collective evidence coverage
     # -----------------------------------------------------
 
-    scores = [
+    question_tokens = tokenize(question)
+
+    evidence_text = " ".join(
+        item["sentence"]
+        for item in selected
+    )
+
+    evidence_tokens = tokenize(
+        evidence_text
+    )
+
+    # How much of the question is covered by the
+    # combined supporting evidence?
+    if question_tokens:
+
+        covered_tokens = (
+            question_tokens
+            .intersection(evidence_tokens)
+        )
+
+        question_coverage = (
+                len(covered_tokens)
+                / len(question_tokens)
+        )
+
+    else:
+
+        question_coverage = 0.0
+
+    # Strength of the best supporting evidence
+    max_score = max(
         item["score"]
         for item in selected
-    ]
+    )
 
+    # Average quality of selected evidence
     average_score = (
-        sum(scores)
-        / len(scores)
+            sum(
+                item["score"]
+                for item in selected
+            )
+            / len(selected)
     )
 
-
-    # Strongest evidence
-    max_score = max(scores)
-
-
+    # Collective confidence
     confidence = (
-        0.5 * max_score
-        + 0.5 * average_score
+            0.50 * question_coverage
+            + 0.30 * max_score
+            + 0.20 * average_score
     )
 
+    # If multiple independent chunks collectively
+    # cover the question very well, boost confidence.
+    if (
+            len(selected) >= 2
+            and question_coverage >= 0.75
+    ):
+        confidence += 0.15
 
     confidence = min(
         0.98,
