@@ -7,13 +7,13 @@ import re
 
 app = FastAPI(
     title="SafeAnswer Grounded QA API",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # CORS
-# ---------------------------------------------------------
+# =========================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,9 +24,9 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------
-# Request / Response Models
-# ---------------------------------------------------------
+# =========================================================
+# DATA MODELS
+# =========================================================
 
 class Chunk(BaseModel):
     chunk_id: str
@@ -45,9 +45,9 @@ class QAResponse(BaseModel):
     answerable: bool
 
 
-# ---------------------------------------------------------
-# Utility functions
-# ---------------------------------------------------------
+# =========================================================
+# TEXT PROCESSING
+# =========================================================
 
 STOPWORDS = {
     "a", "an", "the",
@@ -59,25 +59,25 @@ STOPWORDS = {
     "with", "from", "by",
     "does", "do", "did",
     "it", "this", "that",
-    "be", "as"
+    "be", "as",
+    "tell", "me"
 }
 
 
 def tokenize(text: str):
-    """
-    Convert text into normalized tokens.
-    """
+
     return set(
-        word
-        for word in re.findall(r"[a-z0-9]+", text.lower())
-        if word not in STOPWORDS
+        token
+        for token in re.findall(
+            r"[a-z0-9]+",
+            text.lower()
+        )
+        if token not in STOPWORDS
     )
 
 
 def sentence_split(text: str):
-    """
-    Split chunk text into sentences.
-    """
+
     return [
         sentence.strip()
         for sentence in re.split(
@@ -88,41 +88,289 @@ def sentence_split(text: str):
     ]
 
 
-def score_sentence(question: str, sentence: str):
-    """
-    Calculate a conservative lexical grounding score.
-    """
+# =========================================================
+# QUESTION TYPE DETECTION
+# =========================================================
 
-    question_tokens = tokenize(question)
-    sentence_tokens = tokenize(sentence)
+def detect_question_type(question: str):
 
-    if not question_tokens or not sentence_tokens:
+    q = question.lower().strip()
+
+    if q.startswith("who"):
+        return "who"
+
+    if q.startswith("when") or "what year" in q:
+        return "when"
+
+    if q.startswith("where"):
+        return "where"
+
+    if q.startswith("why"):
+        return "why"
+
+    if q.startswith("how many"):
+        return "number"
+
+    if q.startswith("how much"):
+        return "number"
+
+    if q.startswith("how"):
+        return "how"
+
+    if q.startswith("what"):
+        return "what"
+
+    return "general"
+
+
+# =========================================================
+# SENTENCE RELEVANCE
+# =========================================================
+
+def sentence_score(
+    question: str,
+    sentence: str
+):
+
+    q_tokens = tokenize(question)
+    s_tokens = tokenize(sentence)
+
+    if not q_tokens or not s_tokens:
         return 0.0
 
-    overlap = question_tokens.intersection(sentence_tokens)
+    overlap = q_tokens.intersection(
+        s_tokens
+    )
 
-    coverage = len(overlap) / len(question_tokens)
+    coverage = (
+        len(overlap)
+        / len(q_tokens)
+    )
 
-    # Exact phrase match gets additional weight.
-    question_clean = question.lower().strip(" ?.!")
+    # Entity / number overlap
+    q_numbers = set(
+        re.findall(
+            r"\b\d{4}\b",
+            question
+        )
+    )
 
+    s_numbers = set(
+        re.findall(
+            r"\b\d{4}\b",
+            sentence
+        )
+    )
+
+    number_bonus = 0.0
+
+    if q_numbers.intersection(
+        s_numbers
+    ):
+        number_bonus = 0.2
+
+    # Exact phrase bonus
     phrase_bonus = 0.0
 
+    q_clean = question.lower().strip(
+        " ?!."
+    )
+
     if (
-        question_clean
-        and question_clean in sentence.lower()
+        len(q_clean) > 5
+        and q_clean in sentence.lower()
     ):
-        phrase_bonus = 0.35
+        phrase_bonus = 0.3
+
+    score = (
+        coverage
+        + number_bonus
+        + phrase_bonus
+    )
 
     return min(
         1.0,
-        coverage + phrase_bonus
+        score
     )
 
 
-# ---------------------------------------------------------
-# Grounded QA Logic
-# ---------------------------------------------------------
+# =========================================================
+# FIND SUPPORTING EVIDENCE
+# =========================================================
+
+def find_evidence(
+    question: str,
+    chunks: List[Chunk]
+):
+
+    evidence = []
+
+    for chunk in chunks:
+
+        sentences = sentence_split(
+            chunk.text
+        )
+
+        for sentence in sentences:
+
+            score = sentence_score(
+                question,
+                sentence
+            )
+
+            if score >= 0.25:
+
+                evidence.append(
+                    {
+                        "chunk_id": chunk.chunk_id,
+                        "sentence": sentence,
+                        "score": score
+                    }
+                )
+
+    evidence.sort(
+        key=lambda x: (
+            -x["score"],
+            x["chunk_id"]
+        )
+    )
+
+    return evidence
+
+
+# =========================================================
+# ANSWER CONSTRUCTION
+# =========================================================
+
+def build_answer(
+    question: str,
+    evidence
+):
+
+    if not evidence:
+        return None, [], 0.0
+
+
+    # -----------------------------------------------------
+    # Select strong evidence
+    # -----------------------------------------------------
+
+    strong = [
+        item
+        for item in evidence
+        if item["score"] >= 0.35
+    ]
+
+
+    if not strong:
+        return None, [], 0.0
+
+
+    # Maximum evidence sentences to use
+    selected = strong[:5]
+
+
+    # -----------------------------------------------------
+    # Remove duplicate sentences
+    # -----------------------------------------------------
+
+    seen = set()
+    unique = []
+
+    for item in selected:
+
+        key = item["sentence"].lower()
+
+        if key not in seen:
+
+            seen.add(key)
+
+            unique.append(item)
+
+
+    selected = unique
+
+
+    if not selected:
+        return None, [], 0.0
+
+
+    # -----------------------------------------------------
+    # Combine evidence
+    # -----------------------------------------------------
+
+    answer_parts = [
+        item["sentence"]
+        for item in selected
+    ]
+
+
+    answer = " ".join(
+        answer_parts
+    )
+
+
+    # -----------------------------------------------------
+    # Collect ALL supporting citations
+    # -----------------------------------------------------
+
+    citations = []
+
+    for item in selected:
+
+        chunk_id = item["chunk_id"]
+
+        if chunk_id not in citations:
+
+            citations.append(
+                chunk_id
+            )
+
+
+    # -----------------------------------------------------
+    # Confidence
+    # -----------------------------------------------------
+
+    scores = [
+        item["score"]
+        for item in selected
+    ]
+
+    average_score = (
+        sum(scores)
+        / len(scores)
+    )
+
+
+    # Strongest evidence
+    max_score = max(scores)
+
+
+    confidence = (
+        0.5 * max_score
+        + 0.5 * average_score
+    )
+
+
+    confidence = min(
+        0.98,
+        max(
+            0.0,
+            confidence
+        )
+    )
+
+
+    return (
+        answer,
+        citations,
+        confidence
+    )
+
+
+# =========================================================
+# MAIN QA FUNCTION
+# =========================================================
 
 def answer_question(
     question: str,
@@ -133,7 +381,10 @@ def answer_question(
     # Validate question
     # -----------------------------------------------------
 
-    if not question or not question.strip():
+    if (
+        not question
+        or not question.strip()
+    ):
 
         return QAResponse(
             answer="I don't know",
@@ -147,16 +398,35 @@ def answer_question(
     # Validate chunks
     # -----------------------------------------------------
 
-    valid_chunks = [
-        chunk
-        for chunk in chunks
+    valid_chunks = []
+
+    seen_ids = set()
+
+    for chunk in chunks:
+
         if (
+            not chunk.chunk_id
+            or not chunk.chunk_id.strip()
+        ):
+            continue
+
+        if (
+            not chunk.text
+            or not chunk.text.strip()
+        ):
+            continue
+
+        # Prevent duplicate IDs
+        if chunk.chunk_id in seen_ids:
+            continue
+
+        seen_ids.add(
             chunk.chunk_id
-            and chunk.chunk_id.strip()
-            and chunk.text
-            and chunk.text.strip()
         )
-    ]
+
+        valid_chunks.append(
+            chunk
+        )
 
 
     if not valid_chunks:
@@ -170,35 +440,37 @@ def answer_question(
 
 
     # -----------------------------------------------------
-    # Score every sentence in every chunk
+    # Find evidence
     # -----------------------------------------------------
 
-    candidates = []
-
-
-    for chunk in valid_chunks:
-
-        for sentence in sentence_split(chunk.text):
-
-            score = score_sentence(
-                question,
-                sentence
-            )
-
-            if score > 0:
-
-                candidates.append({
-                    "score": score,
-                    "sentence": sentence,
-                    "chunk_id": chunk.chunk_id
-                })
+    evidence = find_evidence(
+        question,
+        valid_chunks
+    )
 
 
     # -----------------------------------------------------
-    # No grounded evidence
+    # Build grounded answer
     # -----------------------------------------------------
 
-    if not candidates:
+    (
+        answer,
+        citations,
+        confidence
+    ) = build_answer(
+        question,
+        evidence
+    )
+
+
+    # -----------------------------------------------------
+    # No sufficient evidence
+    # -----------------------------------------------------
+
+    if (
+        not answer
+        or not citations
+    ):
 
         return QAResponse(
             answer="I don't know",
@@ -209,84 +481,59 @@ def answer_question(
 
 
     # -----------------------------------------------------
-    # Sort by score
+    # Validate every citation
     # -----------------------------------------------------
 
-    candidates.sort(
-        key=lambda item: (
-            -item["score"],
-            item["chunk_id"]
-        )
-    )
+    valid_ids = {
+        chunk.chunk_id
+        for chunk in valid_chunks
+    }
 
 
-    best = candidates[0]
+    citations = [
+        citation
+        for citation in citations
+        if citation in valid_ids
+    ]
 
 
-    # -----------------------------------------------------
-    # Conservative answerability threshold
-    # -----------------------------------------------------
-
-    if best["score"] < 0.45:
-
-        confidence = min(
-            0.3,
-            best["score"] * 0.5
-        )
+    if not citations:
 
         return QAResponse(
             answer="I don't know",
             citations=[],
-            confidence=round(
-                confidence,
-                3
+            confidence=0.0,
+            answerable=False
+        )
+
+
+    # -----------------------------------------------------
+    # Enforce answerability threshold
+    # -----------------------------------------------------
+
+    if confidence < 0.45:
+
+        return QAResponse(
+            answer="I don't know",
+            citations=[],
+            confidence=min(
+                0.3,
+                round(
+                    confidence,
+                    3
+                )
             ),
             answerable=False
         )
 
 
     # -----------------------------------------------------
-    # Calculate confidence
-    # -----------------------------------------------------
-
-    confidence = min(
-        0.98,
-        0.55 + (
-            0.43 * best["score"]
-        )
-    )
-
-
-    # -----------------------------------------------------
-    # Verify citation ID is real
-    # -----------------------------------------------------
-
-    valid_chunk_ids = {
-        chunk.chunk_id
-        for chunk in valid_chunks
-    }
-
-
-    citation = best["chunk_id"]
-
-
-    if citation not in valid_chunk_ids:
-
-        return QAResponse(
-            answer="I don't know",
-            citations=[],
-            confidence=0.0,
-            answerable=False
-        )
-
-
-    # -----------------------------------------------------
-    # Return grounded answer
+    # Return grounded response
     # -----------------------------------------------------
 
     return QAResponse(
-        answer=best["sentence"],
-        citations=[citation],
+        answer=answer,
+        citations=citations,
         confidence=round(
             confidence,
             3
@@ -295,15 +542,17 @@ def answer_question(
     )
 
 
-# ---------------------------------------------------------
-# API Endpoint
-# ---------------------------------------------------------
+# =========================================================
+# API ENDPOINT
+# =========================================================
 
 @app.post(
     "/grounded-qa",
     response_model=QAResponse
 )
-def grounded_qa(request: QARequest):
+def grounded_qa(
+    request: QARequest
+):
 
     return answer_question(
         request.question,
@@ -311,14 +560,15 @@ def grounded_qa(request: QARequest):
     )
 
 
-# ---------------------------------------------------------
-# Health check
-# ---------------------------------------------------------
+# =========================================================
+# HEALTH CHECK
+# =========================================================
 
 @app.get("/")
 def health():
 
     return {
         "status": "ok",
-        "service": "SafeAnswer Grounded QA API"
+        "service": "SafeAnswer Grounded QA API",
+        "version": "2.0.0"
     }
